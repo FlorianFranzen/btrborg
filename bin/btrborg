@@ -101,20 +101,20 @@ esac
 # Configuration
 # ---------------------------------------------------------------------------
 
-if [[ -n $config ]]; then
+# A configuration file given explicitly must exist; the default is optional,
+# because everything can also be passed through the environment.
+if [[ $config_explicit -eq 1 && -z $config ]]; then
+    die "option '--config' requires a file name"
+elif [[ -n $config ]]; then
     [[ -r $config ]] || die "cannot read configuration file '$config'"
 elif [[ -r /etc/btrborg.conf ]]; then
     config=/etc/btrborg.conf
 fi
-# A configuration file given explicitly must exist; the default is optional,
-# because everything can also be passed through the environment.
 if [[ -n $config ]]; then
     set -a
     # shellcheck source=/dev/null
     . "$config"
     set +a
-elif [[ $config_explicit -eq 1 ]]; then
-    die "no configuration file given"
 fi
 
 [[ -n ${BORG_REPO_BASE:-} ]] ||
@@ -161,10 +161,12 @@ parse_raw_line() {
 }
 
 # Ask btrbk for the latest snapshot of every subvolume and fill the parallel
-# arrays `names`, `versions` and `paths`.
+# arrays `names`, `versions` and `paths`. `index` maps a subvolume name to
+# its position in those arrays, `seen` records every name btrbk reported.
 names=()
 versions=()
 paths=()
+declare -A index=()
 declare -A seen=()
 
 collect_snapshots() {
@@ -192,8 +194,6 @@ collect_snapshots() {
             continue
         }
 
-        # btrbk prints one row per target; a subvolume is handled only once.
-        [[ -z ${seen[$subvol]-} ]] || continue
         seen[$subvol]=1
 
         if [[ ${#filters[@]} -gt 0 ]]; then
@@ -204,16 +204,34 @@ collect_snapshots() {
             [[ $wanted -eq 1 ]] || continue
         fi
 
+        # btrbk prints one row per target, each with the latest snapshot
+        # that target has received, plus the newest snapshot if no target
+        # has it yet. Keep the newest; btrbk timestamps sort lexically.
+        if [[ -n ${index[$subvol]-} ]]; then
+            local i=${index[$subvol]}
+            # Two subvolumes with the same name on different volumes would
+            # share one repository and overwrite each other's history.
+            [[ ${path%/*} == "${paths[$i]%/*}" ]] ||
+                die "subvolume name '$subvol' is ambiguous: snapshots in both '${paths[$i]%/*}' and '${path%/*}' (set snapshot_name in btrbk.conf)"
+            if [[ $version > "${versions[$i]}" ]]; then
+                versions[i]=$version
+                paths[i]=$path
+            fi
+            continue
+        fi
+
+        index[$subvol]=${#names[@]}
         names+=("$subvol")
         versions+=("$version")
         paths+=("$path")
     done <<< "$output"
 
     if [[ ${#filters[@]} -gt 0 ]]; then
-        local f
+        local f unknown=0
         for f in "${filters[@]}"; do
-            [[ -n ${seen[$f]-} ]] || warn "no btrbk snapshot found for subvolume '$f'"
+            [[ -n ${seen[$f]-} ]] || { error "no btrbk snapshot found for subvolume '$f'"; unknown=1; }
         done
+        [[ $unknown -eq 0 ]] || exit 2
     fi
 }
 
@@ -247,8 +265,15 @@ repo_exists() {
     "$borg" info "$1" > /dev/null 2>&1
 }
 
+# The listing is captured first instead of piped into grep: with pipefail,
+# grep -q quitting early could make borg die of SIGPIPE and the pipeline
+# fail, which would look like a missing archive. If borg cannot list the
+# repository at all, the archive is reported missing and the subsequent
+# borg create shows the real error.
 archive_exists() {
-    "$borg" list --short "$1" 2> /dev/null | grep -qxF -- "$2"
+    local archives
+    archives=$("$borg" list --short "$1" 2> /dev/null) || return 1
+    grep -qxF -- "$2" <<< "$archives"
 }
 
 cmd_list() {
@@ -272,7 +297,9 @@ cmd_init() {
     fi
     for i in "${!names[@]}"; do
         repo=$(repo_of "${names[$i]}")
-        if repo_exists "$repo"; then
+        # A dry run must not touch the repositories, so it cannot know which
+        # ones exist and prints the command for all of them.
+        if [[ $dry_run -eq 0 ]] && repo_exists "$repo"; then
             log "Repository '$repo' already exists, skipping"
             continue
         fi
@@ -372,9 +399,15 @@ cmd_run() {
 
 collect_snapshots
 
+# Nothing to do is fine for a listing, but a backup run that finds no
+# snapshots points at a broken setup and must not pass silently.
 if [[ ${#names[@]} -eq 0 ]]; then
-    warn "btrbk reported no snapshots"
-    exit 0
+    if [[ $command == list ]]; then
+        warn "btrbk reported no snapshots"
+        exit 0
+    fi
+    error "btrbk reported no snapshots"
+    exit 1
 fi
 
 "cmd_$command"

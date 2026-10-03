@@ -63,8 +63,18 @@ _BORG_PASSCOMMAND_ has to be set for every command except *list*.
 *BTRBORG_CREATE_ARGS*, *BTRBORG_CHECK_ARGS*, *BTRBORG_PRUNE_ARGS*,
 *BTRBORG_COMPACT_ARGS*
 	Extra options for the corresponding borg command, for example
-	_--exclude-caches_ for *create* or _--verify-data_ for *check*.
-	Default: empty.
+	_--exclude-caches_ for *create*. Default: empty.
+
+	*borg check* without options verifies the whole repository on every
+	run, which reads all of its data and can take hours on large or remote
+	repositories. For a daily *run*, _--archives-only_ checks just the
+	latest archive, _--max-duration 1800_ verifies the repository in
+	half-hour slices across runs, and _--verify-data_ adds a (slow)
+	cryptographic check of the archive contents. For example:
+
+```
+BTRBORG_CHECK_ARGS='--archives-only'
+```
 
 *BTRBORG_BTRBK_ARGS*
 	Options passed to *btrbk list latest*, most usefully

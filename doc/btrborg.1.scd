@@ -25,6 +25,12 @@ name at the last dot into the subvolume name (_home_) and the timestamp
 The archive is created from inside the snapshot directory, so paths inside
 the archive are relative to the subvolume root.
 
+btrbk reports one line per target with the latest snapshot that target has
+received; btrborg always picks the newest snapshot of a subvolume, whether or
+not it has reached a btrbk target yet. Two subvolumes with the same name on
+different volumes would share one repository, so btrborg refuses to run in
+that case; give them distinct names with btrbk's _snapshot_name_ option.
+
 btrborg has to run with enough privileges to read every snapshot and to let
 btrbk inspect the btrfs volume, which usually means running it as root.
 
@@ -37,7 +43,8 @@ btrbk inspect the btrfs volume, which usually means running it as root.
 *init*
 	Create the borg repositories that do not exist yet with
 	*borg init* and the options in _BTRBORG_INIT_ARGS_. Existing
-	repositories are left alone.
+	repositories are detected with *borg info* and left alone, so the
+	passphrase has to be correct even for this command.
 
 *create*
 	Archive the latest snapshot of every subvolume. If the archive already
@@ -49,6 +56,9 @@ btrbk inspect the btrfs volume, which usually means running it as root.
 
 *check*
 	Run *borg check* on every repository, verifying the latest archive.
+	By default borg checks the whole repository as well, which reads every
+	segment and can take long on large or remote repositories; see
+	_BTRBORG_CHECK_ARGS_ in *btrborg.conf*(5) to limit the check.
 
 *prune*
 	Apply the retention policy in _BTRBORG_KEEP_ to every repository. Only
@@ -65,7 +75,7 @@ btrbk inspect the btrfs volume, which usually means running it as root.
 	*compact*. This is what the systemd service of the NixOS module runs.
 
 If one or more _SUBVOLUME_ names are given, only those subvolumes are
-processed. A name that btrbk does not know produces a warning.
+processed. A name that btrbk does not know is an error.
 
 # OPTIONS
 
@@ -75,7 +85,9 @@ processed. A name that btrbk does not know produces a warning.
 
 *-n*, *--dry-run*
 	Print the borg commands that would run instead of running them.
-	Nothing is changed, not even repositories are inspected.
+	Nothing is changed, not even repositories are inspected; *init* and
+	*create* therefore print a command for every subvolume, including
+	those they would skip in a real run.
 
 *-v*, *--verbose*
 	Print every borg command before running it.
@@ -100,12 +112,14 @@ _BORG_REMOTE_PATH_, are passed through.
 	but do not change the exit status.
 
 *1*
-	At least one borg operation failed. btrborg keeps going with the next
-	subvolume after a failure, so look at the output for details.
+	At least one borg operation failed, or btrbk reported no snapshots at
+	all (*list* only warns in that case). btrborg keeps going with the
+	next subvolume after a failure, so look at the output for details.
 
 *2*
-	Usage error, unreadable configuration, missing _BORG_REPO_BASE_ or
-	btrbk failing to list snapshots.
+	Usage error, unknown _SUBVOLUME_ name, unreadable configuration,
+	missing _BORG_REPO_BASE_, ambiguous subvolume names or btrbk failing
+	to list snapshots.
 
 # EXAMPLES
 

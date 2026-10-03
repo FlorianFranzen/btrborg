@@ -78,6 +78,10 @@ in
         `BORG_RSH`, sourced at the end of `/etc/btrborg.conf`. Make sure it
         is only readable by root. It is sourced, not merely parsed, so every
         value must be quoted the way a shell expects.
+
+        Pass the location as a string such as `"/run/secrets/btrborg"`. A
+        path literal like `./secrets/btrborg` would be copied into the
+        world-readable Nix store.
       '';
     };
 

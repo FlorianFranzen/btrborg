@@ -17,6 +17,8 @@ BORG_PASSPHRASE='change me'
 #BTRBORG_KEEP='--keep-within 7d --keep-daily 14 --keep-weekly 4 --keep-monthly 12 --keep-yearly -1'
 #BTRBORG_INIT_ARGS='--encryption repokey-blake2'
 #BTRBORG_CREATE_ARGS=''
+# A full `borg check` reads the whole repository; `--archives-only` or
+# `--max-duration SECONDS` keep a daily run short on large repositories.
 #BTRBORG_CHECK_ARGS=''
 #BTRBORG_PRUNE_ARGS=''
 #BTRBORG_COMPACT_ARGS=''

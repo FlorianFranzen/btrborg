@@ -147,15 +147,22 @@ scdoc < doc/btrborg.conf.5.scd > btrborg.conf.5
 ## How it works
 
 1. `btrbk list latest --format=raw` reports, for every configured
-   subvolume, the most recent snapshot and its path. btrborg parses that
-   output (without `eval`), ignores rows that have no snapshot, and handles
-   each subvolume once even if btrbk lists it for several targets.
+   subvolume and target, the most recent snapshot and its path. btrborg
+   parses that output (without `eval`), ignores rows that have no snapshot,
+   and keeps the newest snapshot of each subvolume even if btrbk lists an
+   older one for a target that is lagging behind.
 2. The snapshot name `<name>.<timestamp>` is split at the last dot. `name`
    selects the repository `$BORG_REPO_BASE/<name>`, `timestamp` names the
    archive `btrbk.<timestamp>`.
 3. The requested borg command runs per subvolume. borg warnings (exit 1)
    are printed but tolerated; errors (exit 2 and up) are counted and make
-   btrborg exit with status 1 after all subvolumes have been handled.
+   btrborg exit with status 1 after all subvolumes have been handled. A
+   backup run that finds no snapshots at all, or is given a subvolume name
+   btrbk does not know, fails instead of silently doing nothing.
+
+`run` includes a `borg check` of every repository. On large repositories
+set `BTRBORG_CHECK_ARGS='--archives-only'` or `--max-duration SECONDS` to
+keep the daily run short; see btrborg.conf(5).
 
 ## Development
 

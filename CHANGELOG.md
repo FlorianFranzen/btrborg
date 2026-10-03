@@ -34,3 +34,12 @@ unversioned helper next to a btrbk installation.
 - `run` only prunes when every create and check succeeded.
 - Borg errors are reported per subvolume and the exit status is non-zero if
   any operation failed.
+- When btrbk lists a subvolume for several targets, the newest snapshot is
+  used, not the first row. Subvolumes whose name is ambiguous across
+  volumes are refused instead of sharing one repository.
+- An unknown subvolume name or an empty snapshot list is an error for every
+  command except `list`, so a misconfigured timer run cannot pass silently.
+- `--dry-run` no longer inspects repositories during `init`.
+
+[Unreleased]: https://github.com/FlorianFranzen/btrborg/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/FlorianFranzen/btrborg/releases/tag/v0.1.0

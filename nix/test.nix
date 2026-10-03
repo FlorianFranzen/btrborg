@@ -97,9 +97,16 @@ in
         assert f"data\tbtrbk.{version}\t/mnt/.snapshots/data.{version}\t/var/lib/borg/data" in out, out
         assert "\nwww\tbtrbk." in out, out
         assert machine.succeed("btrborg list www | wc -l").strip() == "1"
-        assert machine.succeed("btrborg list nope 2>&1 | grep -c 'no btrbk snapshot found for subvolume'").strip() == "1"
+        status, out = machine.execute("btrborg list nope 2>&1")
+        assert status == 2 and "no btrbk snapshot found for subvolume 'nope'" in out, (status, out)
 
     with subtest("init"):
+        # A dry run does not look at the repositories, so it prints a
+        # command for every subvolume, and creates nothing.
+        out = machine.succeed("btrborg --dry-run init")
+        assert out.count("+ borg init --encryption repokey-blake2 /var/lib/borg/") == 2, out
+        machine.fail("test -e /var/lib/borg/data")
+
         machine.succeed("btrborg init")
         borg("info /var/lib/borg/data")
         borg("info /var/lib/borg/www")
@@ -166,6 +173,8 @@ in
         assert status == 1, f"expected exit status 1, got {status}"
         status, out = machine.execute("btrborg -c /nonexistent list 2>&1")
         assert status == 2 and "cannot read" in out, (status, out)
+        status, out = machine.execute("btrborg --config= list 2>&1")
+        assert status == 2 and "requires a file name" in out, (status, out)
         status, out = machine.execute("btrborg bogus 2>&1")
         assert status == 2 and "unknown command" in out, (status, out)
   '';
