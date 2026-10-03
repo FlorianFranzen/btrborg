@@ -1,0 +1,25 @@
+# Example configuration for btrborg. Copy to /etc/btrborg.conf and adjust.
+# The file is sourced by bash, so quote values as a shell expects.
+# See btrborg.conf(5) for every variable.
+
+# Required: repositories are created as $BORG_REPO_BASE/<subvolume>.
+BORG_REPO_BASE='/var/lib/borg'
+#BORG_REPO_BASE='ssh://borg@backup.example.org/./btrbk'
+
+# Passphrase for all repositories. Keep this file root-only, or source a
+# separate secret file here instead:
+#. /etc/btrborg.secret
+BORG_PASSPHRASE='change me'
+
+# Optional tuning. The values shown are the defaults.
+#BTRBORG_ARCHIVE_PREFIX='btrbk.'
+#BTRBORG_COMPRESSION='zstd,3'
+#BTRBORG_KEEP='--keep-within 7d --keep-daily 14 --keep-weekly 4 --keep-monthly 12 --keep-yearly -1'
+#BTRBORG_INIT_ARGS='--encryption repokey-blake2'
+#BTRBORG_CREATE_ARGS=''
+#BTRBORG_CHECK_ARGS=''
+#BTRBORG_PRUNE_ARGS=''
+#BTRBORG_COMPACT_ARGS=''
+
+# Where btrbk finds its configuration, if not the default location.
+#BTRBORG_BTRBK_ARGS='-c /etc/btrbk/btrbk.conf'

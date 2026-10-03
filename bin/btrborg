@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+#
+# btrborg - back up the latest btrbk snapshot of every subvolume into a
+# borg repository of the same name.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+# Replaced with the release version when packaged.
+BTRBORG_VERSION='@VERSION@'
+placeholder='@VERSION'
+[[ $BTRBORG_VERSION == "${placeholder}@" ]] && BTRBORG_VERSION='git'
+
+# Program name for messages; strip the decoration added by wrapProgram.
+PROG=${0##*/}
+PROG=${PROG#.}
+PROG=${PROG%-wrapped}
+readonly PROG
+
+usage() {
+    cat <<USAGE
+Usage: $PROG [OPTIONS] COMMAND [SUBVOLUME...]
+
+Back up the latest btrbk snapshot of every subvolume into a borg
+repository named after the subvolume below BORG_REPO_BASE.
+
+Commands:
+  list      list the latest snapshot and archive name of every subvolume
+  init      create the borg repositories that do not exist yet
+  create    archive the latest snapshot of every subvolume
+  info      show information about the latest archive of every subvolume
+  check     verify the latest archive of every subvolume
+  prune     apply the retention policy to every repository
+  compact   free space in every repository (borg >= 1.2)
+  run       create, check, and if that succeeded prune and compact
+
+If one or more SUBVOLUME names are given, only those are processed.
+
+Options:
+  -c, --config FILE   read configuration from FILE
+                      (default: \$BTRBORG_CONFIG or /etc/btrborg.conf)
+  -n, --dry-run       print the borg commands instead of running them
+  -v, --verbose       print every borg command before running it
+  -h, --help          show this help and exit
+  -V, --version       print the version and exit
+
+See btrborg(1) and btrborg.conf(5) for details.
+USAGE
+}
+
+log() { printf '%s\n' "$*"; }
+warn() { printf '%s: warning: %s\n' "$PROG" "$*" >&2; }
+error() { printf '%s: error: %s\n' "$PROG" "$*" >&2; }
+die() { error "$@"; exit 2; }
+heading() { printf '= %s =\n' "$*"; }
+
+# ---------------------------------------------------------------------------
+# Option parsing
+# ---------------------------------------------------------------------------
+
+config=${BTRBORG_CONFIG:-}
+config_explicit=0
+dry_run=0
+verbose=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|--config)
+            [[ $# -ge 2 ]] || die "option '$1' requires an argument"
+            config=$2
+            config_explicit=1
+            shift 2
+            ;;
+        --config=*)
+            config=${1#*=}
+            config_explicit=1
+            shift
+            ;;
+        -n|--dry-run) dry_run=1; shift ;;
+        -v|--verbose) verbose=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        -V|--version) log "$PROG $BTRBORG_VERSION"; exit 0 ;;
+        --) shift; break ;;
+        -*) die "unknown option '$1' (try --help)" ;;
+        *) break ;;
+    esac
+done
+
+[[ $# -ge 1 ]] || { usage >&2; exit 2; }
+command=$1
+shift
+filters=("$@")
+
+case "$command" in
+    list|init|create|info|check|prune|compact|run) ;;
+    *) die "unknown command '$command' (try --help)" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+if [[ -n $config ]]; then
+    [[ -r $config ]] || die "cannot read configuration file '$config'"
+elif [[ -r /etc/btrborg.conf ]]; then
+    config=/etc/btrborg.conf
+fi
+# A configuration file given explicitly must exist; the default is optional,
+# because everything can also be passed through the environment.
+if [[ -n $config ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    . "$config"
+    set +a
+elif [[ $config_explicit -eq 1 ]]; then
+    die "no configuration file given"
+fi
+
+[[ -n ${BORG_REPO_BASE:-} ]] ||
+    die "BORG_REPO_BASE is not set (see btrborg.conf(5))"
+
+repo_base=${BORG_REPO_BASE%/}
+archive_prefix=${BTRBORG_ARCHIVE_PREFIX-btrbk.}
+compression=${BTRBORG_COMPRESSION:-zstd,3}
+borg=${BTRBORG_BORG:-borg}
+btrbk=${BTRBORG_BTRBK:-btrbk}
+
+# Space separated option strings are split into arrays once, here.
+read -ra keep_args <<< "${BTRBORG_KEEP:-"--keep-within 7d --keep-daily 14 --keep-weekly 4 --keep-monthly 12 --keep-yearly -1"}"
+read -ra init_args <<< "${BTRBORG_INIT_ARGS:-"--encryption repokey-blake2"}"
+read -ra create_args <<< "${BTRBORG_CREATE_ARGS:-}"
+read -ra check_args <<< "${BTRBORG_CHECK_ARGS:-}"
+read -ra prune_args <<< "${BTRBORG_PRUNE_ARGS:-}"
+read -ra compact_args <<< "${BTRBORG_COMPACT_ARGS:-}"
+read -ra btrbk_args <<< "${BTRBORG_BTRBK_ARGS:-}"
+
+# ---------------------------------------------------------------------------
+# btrbk integration
+# ---------------------------------------------------------------------------
+
+# Parse one line of `btrbk list --format=raw` output into the associative
+# array `row`. Values are single-quoted the way a shell would quote them
+# (embedded quotes become '\''); only the leading format="..." token uses
+# double quotes. The line is tokenised with a regular expression instead of
+# being eval'd, so that nothing in a path can ever be executed.
+declare -A row
+parse_raw_line() {
+    local line=$1 q="'" key quoted value re
+    re="^ ?([a-z_]+)=(${q}[^${q}]*${q}(\\\\${q}${q}[^${q}]*${q})*|\"[^\"]*\")(.*)\$"
+    row=()
+    while [[ -n $line ]]; do
+        [[ $line =~ $re ]] || return 1
+        key=${BASH_REMATCH[1]}
+        quoted=${BASH_REMATCH[2]}
+        line=${BASH_REMATCH[4]}
+        value=${quoted:1:${#quoted}-2}
+        [[ $quoted == \"* ]] || value=${value//"'\\''"/"'"}
+        row[$key]=$value
+    done
+}
+
+# Ask btrbk for the latest snapshot of every subvolume and fill the parallel
+# arrays `names`, `versions` and `paths`.
+names=()
+versions=()
+paths=()
+declare -A seen=()
+
+collect_snapshots() {
+    local output line name path subvol version
+    output=$("$btrbk" ${btrbk_args[@]+"${btrbk_args[@]}"} list latest --format=raw) ||
+        die "'$btrbk list latest' failed"
+
+    while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        parse_raw_line "$line" || die "cannot parse btrbk output: $line"
+
+        # Rows without a snapshot (e.g. orphaned backups on a target) are of
+        # no use to us.
+        [[ ${row[type]-} == *snapshot* ]] || continue
+        name=${row[snapshot_name]-}
+        path=${row[snapshot_subvolume]:-${row[snapshot_path]-}}
+        [[ -n $name && -n $path ]] || continue
+
+        # Snapshots are named <snapshot_name>.<timestamp>; everything up to
+        # the last dot names the repository, the rest the archive.
+        subvol=${name%.*}
+        version=${name##*.}
+        [[ $subvol != "$name" ]] || {
+            warn "ignoring snapshot '$name' without a timestamp suffix"
+            continue
+        }
+
+        # btrbk prints one row per target; a subvolume is handled only once.
+        [[ -z ${seen[$subvol]-} ]] || continue
+        seen[$subvol]=1
+
+        if [[ ${#filters[@]} -gt 0 ]]; then
+            local wanted=0 f
+            for f in "${filters[@]}"; do
+                [[ $f == "$subvol" ]] && wanted=1
+            done
+            [[ $wanted -eq 1 ]] || continue
+        fi
+
+        names+=("$subvol")
+        versions+=("$version")
+        paths+=("$path")
+    done <<< "$output"
+
+    if [[ ${#filters[@]} -gt 0 ]]; then
+        local f
+        for f in "${filters[@]}"; do
+            [[ -n ${seen[$f]-} ]] || warn "no btrbk snapshot found for subvolume '$f'"
+        done
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# borg integration
+# ---------------------------------------------------------------------------
+
+failed=0
+
+# Run a borg command, honouring --dry-run and --verbose. Borg exits with 1
+# for warnings and >= 2 for errors; warnings are reported but do not count
+# as failures.
+run_borg() {
+    local rc=0
+    if [[ $dry_run -eq 1 || $verbose -eq 1 ]]; then
+        printf '+'; printf ' %q' "$borg" "$@"; printf '\n'
+    fi
+    [[ $dry_run -eq 0 ]] || return 0
+    "$borg" "$@" || rc=$?
+    case $rc in
+        0) ;;
+        1) warn "borg exited with warnings" ;;
+        *) error "borg exited with status $rc"; failed=$((failed + 1)); return 1 ;;
+    esac
+}
+
+repo_of() { printf '%s/%s' "$repo_base" "$1"; }
+archive_of() { printf '%s%s' "$archive_prefix" "$1"; }
+
+repo_exists() {
+    "$borg" info "$1" > /dev/null 2>&1
+}
+
+archive_exists() {
+    "$borg" list --short "$1" 2> /dev/null | grep -qxF -- "$2"
+}
+
+cmd_list() {
+    local i
+    for i in "${!names[@]}"; do
+        printf '%s\t%s\t%s\t%s\n' "${names[$i]}" "$(archive_of "${versions[$i]}")" \
+            "${paths[$i]}" "$(repo_of "${names[$i]}")"
+    done
+}
+
+cmd_init() {
+    local i repo
+    # borg init needs the parent directory of a local repository to exist.
+    # Anything that looks like a URL or host:path is left to borg.
+    if [[ $repo_base != *://* && $repo_base != *:* && ! -d $repo_base ]]; then
+        if [[ $dry_run -eq 1 ]]; then
+            printf '+ mkdir -p %q\n' "$repo_base"
+        else
+            mkdir -p "$repo_base" || die "cannot create '$repo_base'"
+        fi
+    fi
+    for i in "${!names[@]}"; do
+        repo=$(repo_of "${names[$i]}")
+        if repo_exists "$repo"; then
+            log "Repository '$repo' already exists, skipping"
+            continue
+        fi
+        heading "Initialising repository for subvolume '${names[$i]}'"
+        run_borg init ${init_args[@]+"${init_args[@]}"} "$repo" || true
+        log
+    done
+}
+
+cmd_create() {
+    local i repo archive
+    for i in "${!names[@]}"; do
+        repo=$(repo_of "${names[$i]}")
+        archive=$(archive_of "${versions[$i]}")
+        heading "Backing up latest snapshot of subvolume '${names[$i]}'"
+        if [[ $dry_run -eq 1 ]]; then
+            printf '+ cd %q\n' "${paths[$i]}"
+            run_borg create --stats --compression "$compression" \
+                ${create_args[@]+"${create_args[@]}"} "$repo::$archive" .
+            log
+            continue
+        fi
+        if archive_exists "$repo" "$archive"; then
+            log "Archive '$archive' already exists in '$repo', skipping"
+            log
+            continue
+        fi
+        if [[ ! -d ${paths[$i]} ]]; then
+            error "snapshot directory '${paths[$i]}' does not exist"
+            failed=$((failed + 1))
+            log
+            continue
+        fi
+        (
+            cd "${paths[$i]}"
+            run_borg create --stats --compression "$compression" \
+                ${create_args[@]+"${create_args[@]}"} "$repo::$archive" .
+        ) || failed=$((failed + 1))
+        log
+    done
+}
+
+cmd_info() {
+    local i
+    for i in "${!names[@]}"; do
+        heading "Latest backup of subvolume '${names[$i]}'"
+        run_borg info "$(repo_of "${names[$i]}")::$(archive_of "${versions[$i]}")" || true
+        log
+    done
+}
+
+cmd_check() {
+    local i
+    for i in "${!names[@]}"; do
+        heading "Checking latest backup of subvolume '${names[$i]}'"
+        run_borg check --info ${check_args[@]+"${check_args[@]}"} \
+            "$(repo_of "${names[$i]}")::$(archive_of "${versions[$i]}")" || true
+        log
+    done
+}
+
+cmd_prune() {
+    local i
+    for i in "${!names[@]}"; do
+        heading "Pruning backups of subvolume '${names[$i]}'"
+        run_borg prune --stats ${keep_args[@]+"${keep_args[@]}"} \
+            --glob-archives "${archive_prefix}*" ${prune_args[@]+"${prune_args[@]}"} \
+            "$(repo_of "${names[$i]}")" || true
+        log
+    done
+}
+
+cmd_compact() {
+    local i
+    for i in "${!names[@]}"; do
+        heading "Compacting repository of subvolume '${names[$i]}'"
+        run_borg compact ${compact_args[@]+"${compact_args[@]}"} \
+            "$(repo_of "${names[$i]}")" || true
+        log
+    done
+}
+
+cmd_run() {
+    cmd_create
+    cmd_check
+    if [[ $failed -eq 0 ]]; then
+        cmd_prune
+        cmd_compact
+    else
+        error "skipping prune and compact because create or check failed"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+collect_snapshots
+
+if [[ ${#names[@]} -eq 0 ]]; then
+    warn "btrbk reported no snapshots"
+    exit 0
+fi
+
+"cmd_$command"
+
+if [[ $failed -gt 0 ]]; then
+    error "$failed operation(s) failed"
+    exit 1
+fi
